@@ -66,7 +66,6 @@ class ArcDecoder:
             ("score_full_probmul_3", score_full_probmul_3),
         ]
         top_n = 2
-        labels = {}
         num_outputs = {}
         n_cands = {}
         oracle_hits = {}
@@ -80,7 +79,6 @@ class ArcDecoder:
             task_id, output_nr = basekey.rsplit("_", 1)
             num_outputs[task_id] = max(num_outputs.get(task_id, 0), int(output_nr) + 1)
             correct_solution = np.asarray(self.dataset.replies[basekey][0])
-            labels[basekey] = correct_solution
 
             input_grid = np.asarray(self.dataset.queries[basekey]["test"][0]["input"])
             size_differs[basekey] = np.shape(input_grid) != np.shape(correct_solution)
