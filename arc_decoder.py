@@ -61,53 +61,110 @@ class ArcDecoder:
         return {bk: selection_algorithm({k: g for k, g in v.items()}) for bk, v in self.decoded_results.items()}
 
     def benchmark_selection_algos(self):
-        print("*** Benchmark selection algorithms...")
-
+        scorers = [
+            ("score_kgmon", score_kgmon),
+            ("score_full_probmul_3", score_full_probmul_3),
+        ]
+        top_n = 2
         labels = {}
-        num_tasks_per_puzzle = {}
-        num_solved_keys = 0
-        num_total_keys = 0
-
-        correct_beam_scores = []
+        num_outputs = {}
+        n_cands = {}
+        oracle_hits = {}
+        selected_hits = {name: {} for name, _ in scorers}
+        ranks = {name: {} for name, _ in scorers}
+        size_differs = {}
+        timings = []
+        timeouts = 0
 
         for basekey, basevalues in self.decoded_results.items():
+            task_id, output_nr = basekey.rsplit("_", 1)
+            num_outputs[task_id] = max(num_outputs.get(task_id, 0), int(output_nr) + 1)
+            correct_solution = np.asarray(self.dataset.replies[basekey][0])
+            labels[basekey] = correct_solution
 
-            mult_key, mult_sub = basekey.split("_")
-            num_tasks_per_puzzle[mult_key] = max(num_tasks_per_puzzle.get(mult_key, 0), int(mult_sub) + 1)
+            input_grid = np.asarray(self.dataset.queries[basekey]["test"][0]["input"])
+            size_differs[basekey] = np.shape(input_grid) != np.shape(correct_solution)
 
-            labels[basekey] = correct_solution = self.dataset.replies[basekey][0]
+            pool = {}
+            for sample in basevalues.values():
+                solution = np.asarray(sample["solution"])
+                pool.setdefault(hashable(solution), solution)
+                for time_key in ["elapsed", "elapsed_time", "spend_time", "time_sec", "seconds"]:
+                    if time_key in sample:
+                        timings.append(float(sample[time_key]))
+                        break
+                if sample.get("timeout") or sample.get("timed_out"):
+                    timeouts += 1
 
-            for subkey, sample in basevalues.items():
+            n_cands[basekey] = len(pool)
+            oracle_hits[basekey] = any(np.array_equal(correct_solution, solution) for solution in pool.values())
 
-                solution = sample["solution"]
-                beam_score = sample["beam_score"]
-                aug_mean = np.mean(sample["score_aug"])
+            for name, scorer in scorers:
+                ordered = scorer({k: g for k, g in basevalues.items()})
+                rank = None
+                for i, guess in enumerate(ordered, start=1):
+                    if np.array_equal(correct_solution, guess):
+                        rank = i
+                        break
+                ranks[name][basekey] = rank
+                selected_hits[name][basekey] = rank is not None and rank <= top_n
 
-                if np.shape(correct_solution) != np.shape(solution):
-                    corr_str = "bad_xy_size"
-                elif np.array_equal(correct_solution, solution):
-                    corr_str = "ALL_CORRECT"
-                    num_solved_keys += 1
-                    correct_beam_scores.append(beam_score)
-                else:
-                    corr_str = "bad_content"
+        task_count = len(num_outputs)
 
-                output_len = f"{solution.shape[0]}x{solution.shape[1]}"
+        def pass_at_2(hits):
+            if task_count == 0:
+                return 0.0
+            score = 0.0
+            for basekey, hit in hits.items():
+                if hit:
+                    task_id = basekey.rsplit("_", 1)[0]
+                    score += 1.0 / num_outputs[task_id]
+            return score / task_count
 
-                if corr_str == "ALL_CORRECT":
-                    print(f"{corr_str}:{beam_score:8.5f} - {aug_mean:8.5f} {output_len:5s} [{subkey}]")
-                num_total_keys += 1
+        oracle_score = pass_at_2(oracle_hits)
+        selected_scores = {name: pass_at_2(hits) for name, hits in selected_hits.items()}
+        best_name = max(selected_scores, key=selected_scores.get)
+        best_selected = selected_scores[best_name]
 
-        print(f" subkeys: {num_solved_keys}/{num_total_keys}")
-        print(f" avg correct beam score: {np.mean(correct_beam_scores):8.5f}")
-        print(f" max correct beam score: {np.max(correct_beam_scores):8.5f}")
+        def group_acc(keys):
+            if not keys:
+                return 0.0
+            hits = selected_hits[best_name]
+            return sum(1 for key in keys if hits[key]) / len(keys)
 
-        num_puzzles = len(num_tasks_per_puzzle)
+        diff_keys = [key for key, differs in size_differs.items() if differs]
+        same_keys = [key for key, differs in size_differs.items() if not differs]
 
-        for selection_algorithm in selection_algorithms:
-            name = selection_algorithm.__name__
-            selected = self.run_selection_algo(selection_algorithm)
-            correct_puzzles = {k for k, v in selected.items() if any(np.array_equal(guess, labels[k]) for guess in v[:self.n_guesses])}
-            print(correct_puzzles)
-            score = sum(1/num_tasks_per_puzzle[k.split("_")[0]] for k in correct_puzzles)
-            print(f" acc: {score:5.1f}/{num_puzzles:3} ('{name}')")
+        print(f"ORACLE_PASS@2: {oracle_score:.3f}")
+        print(
+            "SELECTED_PASS@2: "
+            f"score_kgmon={selected_scores['score_kgmon']:.3f}, "
+            f"score_full_probmul_3={selected_scores['score_full_probmul_3']:.3f}"
+        )
+        print(f"GAP: {oracle_score - best_selected:.3f}")
+        if timings:
+            timing_array = np.asarray(timings, dtype=float)
+            print(
+                "TIMING: "
+                f"median={np.median(timing_array):.1f}s "
+                f"p90={np.percentile(timing_array, 90):.1f}s "
+                f"max={np.max(timing_array):.1f}s "
+                f"timeouts={timeouts}/{len(timings)}"
+            )
+        print(
+            "SIZE_DIFFERS: "
+            f"{len(diff_keys)}/{len(size_differs)} tasks have output size != input size; "
+            f"acc_diff={group_acc(diff_keys):.3f} acc_same={group_acc(same_keys):.3f}"
+        )
+        print("WORST10 (in pool, not in top-2): task_id n_cand rank_kgmon rank_probmul")
+
+        worst = []
+        for basekey, hit in oracle_hits.items():
+            if hit and not selected_hits[best_name][basekey]:
+                rank_kgmon = ranks["score_kgmon"][basekey]
+                rank_probmul = ranks["score_full_probmul_3"][basekey]
+                best_rank = min(rank_kgmon or 10**9, rank_probmul or 10**9)
+                worst.append((best_rank, basekey, n_cands[basekey], rank_kgmon, rank_probmul))
+        worst = sorted(worst, key=lambda x: (-x[0], x[1]))[:10]
+        for _, basekey, n_cand, rank_kgmon, rank_probmul in worst:
+            print(f"{basekey} {n_cand} {rank_kgmon} {rank_probmul}")
